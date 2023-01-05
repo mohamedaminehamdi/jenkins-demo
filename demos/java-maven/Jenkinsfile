@@ -1,0 +1,120 @@
+// Java Maven CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates a complete CI/CD pipeline for Java Maven projects
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        JAVA_HOME = '/usr/lib/jvm/java-11-openjdk'
+        MAVEN_OPTS = '-Xmx512m -XX:MaxPermSize=128m'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out source code ==='
+                git branch: 'main', url: 'https://github.com/example/java-app.git'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo '=== Building Maven project ==='
+                sh '''
+                    mvn clean compile
+                    mvn package -DskipTests
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                echo '=== Running unit tests ==='
+                sh 'mvn test'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                echo '=== Running SonarQube analysis ==='
+                sh '''
+                    mvn sonar:sonar \
+                        -Dsonar.projectKey=java-app \
+                        -Dsonar.sources=src \
+                        -Dsonar.host.url=http://sonarqube:9000 \
+                        -Dsonar.login=admin:admin
+                '''
+            }
+        }
+
+        stage('Build Artifact') {
+            steps {
+                echo '=== Creating JAR artifact ==='
+                sh 'mvn jar:jar'
+                archiveArtifacts artifacts: 'target/*.jar', allowEmptyArchive: true
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                echo '=== Building Docker image ==='
+                sh '''
+                    docker build -t myrepo/java-app:${BUILD_NUMBER} .
+                    docker tag myrepo/java-app:${BUILD_NUMBER} myrepo/java-app:latest
+                '''
+            }
+        }
+
+        stage('Push to Docker Registry') {
+            steps {
+                echo '=== Pushing Docker image to registry ==='
+                sh '''
+                    docker push myrepo/java-app:${BUILD_NUMBER}
+                    docker push myrepo/java-app:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Dev') {
+            steps {
+                echo '=== Deploying to development environment ==='
+                sh '''
+                    kubectl set image deployment/java-app \
+                        java-app=myrepo/java-app:${BUILD_NUMBER} \
+                        -n dev
+                '''
+            }
+        }
+
+        stage('Smoke Tests') {
+            steps {
+                echo '=== Running smoke tests ==='
+                sh '''
+                    curl -f http://java-app-dev:8080/health || exit 1
+                    echo "Application is healthy"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '=== Cleaning up workspace ==='
+            cleanWs()
+        }
+        success {
+            echo '=== Pipeline completed successfully ==='
+            // Send success notification
+        }
+        failure {
+            echo '=== Pipeline failed ==='
+            // Send failure notification
+        }
+    }
+}

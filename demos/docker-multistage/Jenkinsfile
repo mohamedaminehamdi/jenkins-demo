@@ -1,0 +1,148 @@
+// Docker Multi-Stage Build CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates best practices for Docker multi-stage builds
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        REGISTRY = 'docker.io'
+        IMAGE_NAME = 'myrepo/multistage-app'
+        DOCKER_BUILDKIT = '1'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out source code ==='
+                git branch: 'main', url: 'https://github.com/example/multistage-docker-app.git'
+            }
+        }
+
+        stage('Validate Dockerfile') {
+            steps {
+                echo '=== Validating Dockerfile ==='
+                sh '''
+                    docker run --rm -i hadolint/hadolint < Dockerfile || true
+                '''
+            }
+        }
+
+        stage('Build Test Image') {
+            steps {
+                echo '=== Building test stage ==='
+                sh '''
+                    docker build --target test -t ${IMAGE_NAME}:test-${BUILD_NUMBER} .
+                '''
+            }
+        }
+
+        stage('Run Tests in Container') {
+            steps {
+                echo '=== Running tests inside container ==='
+                sh '''
+                    docker run --rm ${IMAGE_NAME}:test-${BUILD_NUMBER} npm test
+                    docker run --rm ${IMAGE_NAME}:test-${BUILD_NUMBER} npm run lint
+                '''
+            }
+        }
+
+        stage('Build Final Image') {
+            steps {
+                echo '=== Building production image ==='
+                sh '''
+                    docker build --target production \
+                        -t ${IMAGE_NAME}:${BUILD_NUMBER} \
+                        -t ${IMAGE_NAME}:latest \
+                        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                        --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+                        --build-arg VERSION=${BUILD_NUMBER} \
+                        .
+                '''
+            }
+        }
+
+        stage('Scan Image') {
+            steps {
+                echo '=== Scanning Docker image for vulnerabilities ==='
+                sh '''
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                        aquasec/trivy image --severity HIGH,CRITICAL \
+                        ${IMAGE_NAME}:${BUILD_NUMBER} || true
+                '''
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                echo '=== Pushing image to registry ==='
+                sh '''
+                    docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}
+                    docker tag ${IMAGE_NAME}:latest ${REGISTRY}/${IMAGE_NAME}:latest
+                    docker push ${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}
+                    docker push ${REGISTRY}/${IMAGE_NAME}:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '=== Deploying to production ==='
+                sh '''
+                    kubectl set image deployment/multistage-app \
+                        app=${REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER} \
+                        -n production
+                    kubectl rollout status deployment/multistage-app -n production --timeout=10m
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '=== Verifying production deployment ==='
+                sh '''
+                    kubectl get pods -n production -l app=multistage-app
+                    curl -f http://multistage-app-prod:8080/health || exit 1
+                '''
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                echo '=== Cleaning up local images ==='
+                sh '''
+                    docker rmi ${IMAGE_NAME}:test-${BUILD_NUMBER} || true
+                    docker image prune -f --filter "until=24h"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '=== Collecting image metadata ==='
+            sh '''
+                docker inspect ${IMAGE_NAME}:${BUILD_NUMBER} > image-metadata.json || true
+            '''
+            archiveArtifacts artifacts: 'image-metadata.json', allowEmptyArchive: true
+            cleanWs()
+        }
+        success {
+            echo '=== Docker pipeline completed successfully ==='
+        }
+        failure {
+            echo '=== Docker pipeline failed ==='
+        }
+    }
+}

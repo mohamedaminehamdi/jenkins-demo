@@ -1,0 +1,154 @@
+// Node.js NPM CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates a complete CI/CD pipeline for Node.js/NPM applications
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        NODE_VERSION = '18.x'
+        NPM_REGISTRY = 'https://registry.npmjs.org'
+        npm_config_cache = '.npm-cache'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out Node.js source code ==='
+                git branch: 'main', url: 'https://github.com/example/nodejs-app.git'
+            }
+        }
+
+        stage('Setup NodeJS') {
+            steps {
+                echo '=== Setting up Node.js environment ==='
+                sh '''
+                    node -v
+                    npm -v
+                    npm config set registry ${NPM_REGISTRY}
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                echo '=== Installing NPM dependencies ==='
+                sh '''
+                    npm ci --prefer-offline
+                    npm list --depth=0
+                '''
+            }
+        }
+
+        stage('Code Quality - ESLint') {
+            steps {
+                echo '=== Running ESLint ==='
+                sh '''
+                    npx eslint . --ext .js,.jsx,.ts,.tsx --format json > eslint-report.json || true
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                echo '=== Running Jest unit tests ==='
+                sh '''
+                    npm run test -- --coverage --coverageReporters=cobertura --coverageReporters=html
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo '=== Building Node.js application ==='
+                sh '''
+                    npm run build
+                    ls -la dist/
+                '''
+            }
+        }
+
+        stage('Security Audit') {
+            steps {
+                echo '=== Running NPM security audit ==='
+                sh '''
+                    npm audit --production || true
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo '=== Building Docker image ==='
+                sh '''
+                    docker build -t myrepo/nodejs-app:${BUILD_NUMBER} .
+                    docker tag myrepo/nodejs-app:${BUILD_NUMBER} myrepo/nodejs-app:latest
+                '''
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                echo '=== Pushing Docker image ==='
+                sh '''
+                    docker push myrepo/nodejs-app:${BUILD_NUMBER}
+                    docker push myrepo/nodejs-app:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Staging') {
+            steps {
+                echo '=== Deploying to staging environment ==='
+                sh '''
+                    kubectl set image deployment/nodejs-app \
+                        nodejs-app=myrepo/nodejs-app:${BUILD_NUMBER} \
+                        -n staging
+                    kubectl rollout status deployment/nodejs-app -n staging --timeout=5m
+                '''
+            }
+        }
+
+        stage('E2E Tests') {
+            steps {
+                echo '=== Running end-to-end tests ==='
+                sh '''
+                    npm run test:e2e || true
+                '''
+            }
+        }
+
+        stage('Performance Test') {
+            steps {
+                echo '=== Running performance tests ==='
+                sh '''
+                    npm run performance-test || true
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            junit 'test-results.xml'
+            publishHTML([
+                reportDir: 'coverage',
+                reportFiles: 'index.html',
+                reportName: 'Coverage Report'
+            ])
+            archiveArtifacts artifacts: 'dist/**/*,eslint-report.json', allowEmptyArchive: true
+            cleanWs()
+        }
+        success {
+            echo '=== Node.js pipeline completed successfully ==='
+        }
+        failure {
+            echo '=== Node.js pipeline failed ==='
+        }
+    }
+}

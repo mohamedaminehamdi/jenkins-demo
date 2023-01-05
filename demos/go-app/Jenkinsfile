@@ -1,0 +1,148 @@
+// Go Application CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates a complete CI/CD pipeline for Go applications
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        GO_VERSION = '1.19'
+        GOPROXY = 'https://proxy.golang.org,direct'
+        CGO_ENABLED = '0'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out Go source code ==='
+                git branch: 'main', url: 'https://github.com/example/go-app.git'
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                echo '=== Setting up Go environment ==='
+                sh '''
+                    go version
+                    go env
+                '''
+            }
+        }
+
+        stage('Download Dependencies') {
+            steps {
+                echo '=== Downloading Go dependencies ==='
+                sh '''
+                    go mod download
+                    go mod verify
+                '''
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                echo '=== Running golangci-lint ==='
+                sh '''
+                    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+                    golangci-lint run --deadline=5m || true
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                echo '=== Running Go unit tests ==='
+                sh '''
+                    go test -v -race -coverprofile=coverage.out ./...
+                    go tool cover -html=coverage.out -o coverage.html
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo '=== Building Go binary ==='
+                sh '''
+                    GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/app
+                    ls -lh bin/app
+                '''
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                echo '=== Running security scan with Gosec ==='
+                sh '''
+                    curl -sfL https://raw.githubusercontent.com/securego/gosec/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+                    gosec -no-fail -fmt json -out gosec-report.json ./... || true
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo '=== Building Docker image ==='
+                sh '''
+                    docker build -t myrepo/go-app:${BUILD_NUMBER} .
+                    docker tag myrepo/go-app:${BUILD_NUMBER} myrepo/go-app:latest
+                '''
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                echo '=== Pushing Docker image to registry ==='
+                sh '''
+                    docker push myrepo/go-app:${BUILD_NUMBER}
+                    docker push myrepo/go-app:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Dev') {
+            steps {
+                echo '=== Deploying Go app to development ==='
+                sh '''
+                    kubectl set image deployment/go-app \
+                        go-app=myrepo/go-app:${BUILD_NUMBER} \
+                        -n dev
+                    kubectl rollout status deployment/go-app -n dev --timeout=5m
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                echo '=== Health check on deployed application ==='
+                sh '''
+                    sleep 10
+                    curl -f http://go-app-dev:8080/health || exit 1
+                    echo "Go application is healthy"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'bin/app,coverage.html,gosec-report.json', allowEmptyArchive: true
+            publishHTML([
+                reportDir: '.',
+                reportFiles: 'coverage.html',
+                reportName: 'Go Coverage Report'
+            ])
+            cleanWs()
+        }
+        success {
+            echo '=== Go pipeline completed successfully ==='
+        }
+        failure {
+            echo '=== Go pipeline failed ==='
+        }
+    }
+}

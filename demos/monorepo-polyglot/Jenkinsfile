@@ -1,0 +1,259 @@
+// Monorepo Polyglot CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates a complete CI/CD pipeline for monorepo with multiple languages
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+        parallelize: true
+    }
+
+    environment {
+        REGISTRY = 'docker.io'
+        GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out monorepo ==='
+                git branch: 'main', url: 'https://github.com/example/monorepo.git'
+                sh 'git log --oneline -5'
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                echo '=== Detecting changed modules ==='
+                sh '''
+                    echo "Java Service Changes:"
+                    if git diff HEAD~1 --name-only | grep -q '^services/java/'; then
+                        echo "Java service changed"
+                        echo "JAVA_CHANGED=true" >> /tmp/changes.env
+                    fi
+                    
+                    echo "Python Service Changes:"
+                    if git diff HEAD~1 --name-only | grep -q '^services/python/'; then
+                        echo "Python service changed"
+                        echo "PYTHON_CHANGED=true" >> /tmp/changes.env
+                    fi
+                    
+                    echo "Go Service Changes:"
+                    if git diff HEAD~1 --name-only | grep -q '^services/go/'; then
+                        echo "Go service changed"
+                        echo "GO_CHANGED=true" >> /tmp/changes.env
+                    fi
+                    
+                    cat /tmp/changes.env || true
+                '''
+            }
+        }
+
+        stage('Parallel Build') {
+            parallel {
+                stage('Build Java Service') {
+                    steps {
+                        echo '=== Building Java service ==='
+                        dir('services/java') {
+                            sh '''
+                                mvn clean package -DskipTests
+                                docker build -t ${REGISTRY}/monorepo/java-service:${BUILD_NUMBER} .
+                            '''
+                        }
+                    }
+                }
+
+                stage('Build Python Service') {
+                    steps {
+                        echo '=== Building Python service ==='
+                        dir('services/python') {
+                            sh '''
+                                python3 -m venv venv
+                                . venv/bin/activate
+                                pip install -r requirements.txt
+                                pytest tests/ -v
+                                docker build -t ${REGISTRY}/monorepo/python-service:${BUILD_NUMBER} .
+                            '''
+                        }
+                    }
+                }
+
+                stage('Build Go Service') {
+                    steps {
+                        echo '=== Building Go service ==='
+                        dir('services/go') {
+                            sh '''
+                                go mod download
+                                go test -v ./...
+                                GOOS=linux GOARCH=amd64 go build -o bin/app
+                                docker build -t ${REGISTRY}/monorepo/go-service:${BUILD_NUMBER} .
+                            '''
+                        }
+                    }
+                }
+
+                stage('Build Frontend') {
+                    steps {
+                        echo '=== Building frontend ==='
+                        dir('frontend') {
+                            sh '''
+                                npm ci
+                                npm run lint
+                                npm run test
+                                npm run build
+                                docker build -t ${REGISTRY}/monorepo/frontend:${BUILD_NUMBER} .
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Test All Services') {
+            parallel {
+                stage('Integration Tests') {
+                    steps {
+                        echo '=== Running integration tests ==='
+                        sh '''
+                            docker-compose -f docker-compose.test.yml up -d
+                            sleep 10
+                            npm run test:integration
+                            docker-compose -f docker-compose.test.yml down
+                        '''
+                    }
+                }
+
+                stage('Security Scanning') {
+                    steps {
+                        echo '=== Scanning all services for vulnerabilities ==='
+                        sh '''
+                            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                                aquasec/trivy image --severity HIGH,CRITICAL \
+                                ${REGISTRY}/monorepo/java-service:${BUILD_NUMBER} \
+                                ${REGISTRY}/monorepo/python-service:${BUILD_NUMBER} \
+                                ${REGISTRY}/monorepo/go-service:${BUILD_NUMBER} \
+                                || true
+                        '''
+                    }
+                }
+
+                stage('Load Testing') {
+                    steps {
+                        echo '=== Running load tests ==='
+                        sh '''
+                            docker-compose -f docker-compose.load-test.yml up -d
+                            sleep 20
+                            k6 run load-test.js
+                            docker-compose -f docker-compose.load-test.yml down
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Push Images') {
+            steps {
+                echo '=== Pushing all images to registry ==='
+                sh '''
+                    docker push ${REGISTRY}/monorepo/java-service:${BUILD_NUMBER}
+                    docker push ${REGISTRY}/monorepo/python-service:${BUILD_NUMBER}
+                    docker push ${REGISTRY}/monorepo/go-service:${BUILD_NUMBER}
+                    docker push ${REGISTRY}/monorepo/frontend:${BUILD_NUMBER}
+                    
+                    docker tag ${REGISTRY}/monorepo/java-service:${BUILD_NUMBER} ${REGISTRY}/monorepo/java-service:latest
+                    docker tag ${REGISTRY}/monorepo/python-service:${BUILD_NUMBER} ${REGISTRY}/monorepo/python-service:latest
+                    docker tag ${REGISTRY}/monorepo/go-service:${BUILD_NUMBER} ${REGISTRY}/monorepo/go-service:latest
+                    docker tag ${REGISTRY}/monorepo/frontend:${BUILD_NUMBER} ${REGISTRY}/monorepo/frontend:latest
+                    
+                    docker push ${REGISTRY}/monorepo/java-service:latest
+                    docker push ${REGISTRY}/monorepo/python-service:latest
+                    docker push ${REGISTRY}/monorepo/go-service:latest
+                    docker push ${REGISTRY}/monorepo/frontend:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Staging') {
+            steps {
+                echo '=== Deploying all services to staging ==='
+                sh '''
+                    kubectl set image deployment/java-service \
+                        java-service=${REGISTRY}/monorepo/java-service:${BUILD_NUMBER} -n staging
+                    kubectl set image deployment/python-service \
+                        python-service=${REGISTRY}/monorepo/python-service:${BUILD_NUMBER} -n staging
+                    kubectl set image deployment/go-service \
+                        go-service=${REGISTRY}/monorepo/go-service:${BUILD_NUMBER} -n staging
+                    kubectl set image deployment/frontend \
+                        frontend=${REGISTRY}/monorepo/frontend:${BUILD_NUMBER} -n staging
+                    
+                    kubectl rollout status deployment/java-service -n staging --timeout=5m
+                    kubectl rollout status deployment/python-service -n staging --timeout=5m
+                    kubectl rollout status deployment/go-service -n staging --timeout=5m
+                    kubectl rollout status deployment/frontend -n staging --timeout=5m
+                '''
+            }
+        }
+
+        stage('Smoke Tests on Staging') {
+            steps {
+                echo '=== Running smoke tests on staging ==='
+                sh '''
+                    sleep 10
+                    curl -f http://staging-api/health || exit 1
+                    curl -f http://staging-frontend || exit 1
+                    echo "All services healthy on staging"
+                '''
+            }
+        }
+
+        stage('Approval for Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input(message: 'Ready to deploy to production?', ok: 'Deploy')
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '=== Deploying all services to production ==='
+                sh '''
+                    kubectl set image deployment/java-service \
+                        java-service=${REGISTRY}/monorepo/java-service:${BUILD_NUMBER} -n production
+                    kubectl set image deployment/python-service \
+                        python-service=${REGISTRY}/monorepo/python-service:${BUILD_NUMBER} -n production
+                    kubectl set image deployment/go-service \
+                        go-service=${REGISTRY}/monorepo/go-service:${BUILD_NUMBER} -n production
+                    kubectl set image deployment/frontend \
+                        frontend=${REGISTRY}/monorepo/frontend:${BUILD_NUMBER} -n production
+                    
+                    kubectl rollout status deployment/java-service -n production --timeout=10m
+                    kubectl rollout status deployment/python-service -n production --timeout=10m
+                    kubectl rollout status deployment/go-service -n production --timeout=10m
+                    kubectl rollout status deployment/frontend -n production --timeout=10m
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '=== Cleanup ==='
+            sh 'docker image prune -f --filter "until=24h" || true'
+            cleanWs()
+        }
+        success {
+            echo '=== Monorepo pipeline completed successfully ==='
+        }
+        failure {
+            echo '=== Monorepo pipeline failed ==='
+        }
+    }
+}

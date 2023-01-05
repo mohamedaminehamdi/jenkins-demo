@@ -1,0 +1,150 @@
+// Python Flask CI/CD Pipeline Demo
+// This Jenkinsfile demonstrates a complete CI/CD pipeline for Python Flask applications
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        PYTHON_VERSION = '3.9'
+        VENV_DIR = 'venv'
+        PIP_CACHE_DIR = '.cache/pip'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '=== Checking out Python Flask source code ==='
+                git branch: 'main', url: 'https://github.com/example/python-flask-app.git'
+            }
+        }
+
+        stage('Setup Environment') {
+            steps {
+                echo '=== Setting up Python virtual environment ==='
+                sh '''
+                    python3.9 -m venv ${VENV_DIR}
+                    . ${VENV_DIR}/bin/activate
+                    pip install --upgrade pip setuptools wheel
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                echo '=== Installing Python dependencies ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    pip install -r requirements.txt
+                    pip install pytest pytest-cov flake8 pylint
+                '''
+            }
+        }
+
+        stage('Code Quality - Linting') {
+            steps {
+                echo '=== Running Flake8 linter ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    flake8 app/ --count --statistics || true
+                '''
+            }
+        }
+
+        stage('Code Quality - PyLint') {
+            steps {
+                echo '=== Running PyLint ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    pylint app/ --disable=all --enable=E,F || true
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                echo '=== Running unit tests with pytest ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    pytest tests/ -v --junit-xml=test-results.xml --cov=app --cov-report=xml
+                '''
+            }
+        }
+
+        stage('Build Artifact') {
+            steps {
+                echo '=== Building Python distribution ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    python setup.py bdist_wheel
+                '''
+                archiveArtifacts artifacts: 'dist/*.whl', allowEmptyArchive: true
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo '=== Building Docker image for Flask app ==='
+                sh '''
+                    docker build -t myrepo/flask-app:${BUILD_NUMBER} .
+                    docker tag myrepo/flask-app:${BUILD_NUMBER} myrepo/flask-app:latest
+                '''
+            }
+        }
+
+        stage('Push to Docker Registry') {
+            steps {
+                echo '=== Pushing Docker image ==='
+                sh '''
+                    docker push myrepo/flask-app:${BUILD_NUMBER}
+                    docker push myrepo/flask-app:latest
+                '''
+            }
+        }
+
+        stage('Deploy to Dev') {
+            steps {
+                echo '=== Deploying Flask app to development ==='
+                sh '''
+                    kubectl set image deployment/flask-app \
+                        flask-app=myrepo/flask-app:${BUILD_NUMBER} \
+                        -n dev
+                    kubectl rollout status deployment/flask-app -n dev --timeout=5m
+                '''
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                echo '=== Running integration tests ==='
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    pytest tests/integration/ -v || true
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            junit 'test-results.xml'
+            publishHTML([
+                reportDir: 'htmlcov',
+                reportFiles: 'index.html',
+                reportName: 'Coverage Report'
+            ])
+            cleanWs()
+        }
+        success {
+            echo '=== Python Flask pipeline completed successfully ==='
+        }
+        failure {
+            echo '=== Python Flask pipeline failed ==='
+        }
+    }
+}
